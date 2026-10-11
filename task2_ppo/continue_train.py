@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
-
+import time
+import torch
+import torch.nn.functional as F
 from torch.optim import AdamW
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-from common.data import load_yaml, prompt_messages, read_jsonl, repo_path
+from common.data import load_yaml, read_jsonl, repo_path, pad_batch
 from common.logging_utils import set_seed
 from common.models import (
     load_policy,
@@ -15,7 +18,7 @@ from common.models import (
     trainable_parameters,
     value_parameter_groups,
 )
-
+from task2_ppo.ppo import compute_gae, shaped_rewards, ppo_policy_loss, value_mse_loss, normalize_advantages
 
 def prepare_ppo_continuation(config_path: str):
     cfg = load_yaml(config_path)
@@ -60,26 +63,117 @@ def prepare_ppo_continuation(config_path: str):
         "value_optimizer": value_optimizer,
     }
 
+def get_logprobs_and_values(policy, value_model, input_ids, attention_mask, response_mask):
+    """Helper to extract logprobs and values for the generated response."""
+    logits = policy(input_ids=input_ids, attention_mask=attention_mask).logits
+    values = value_model(input_ids=input_ids, attention_mask=attention_mask).squeeze(-1)
+    
+    shifted_logits = logits[:, :-1, :]
+    shifted_labels = input_ids[:, 1:]
+    
+    logprobs = torch.gather(
+        F.log_softmax(shifted_logits, dim=-1), 
+        dim=2, 
+        index=shifted_labels.unsqueeze(2)
+    ).squeeze(-1)
+    
+    shifted_response_mask = response_mask[:, 1:]
+    shifted_values = values[:, :-1]
+    
+    return logprobs * shifted_response_mask, shifted_values * shifted_response_mask, shifted_response_mask
 
 def run_ppo(config_path: str, output: str | None = None, updates: int | None = None, clip_epsilon: float | None = None, kl_beta: float | None = None, run_name: str = "standard"):
+    start_time = time.time()
     bundle = prepare_ppo_continuation(config_path)
     cfg = bundle["cfg"]
-    if updates is not None:
-        cfg["updates"] = int(updates)
-    if clip_epsilon is not None:
-        cfg["clip_epsilon"] = float(clip_epsilon)
-    if kl_beta is not None:
-        cfg["kl_beta"] = float(kl_beta)
+    
+    total_updates = updates if updates is not None else int(cfg.get("updates", 20))
+    eps = clip_epsilon if clip_epsilon is not None else float(cfg.get("clip_epsilon", 0.2))
+    beta = kl_beta if kl_beta is not None else float(cfg.get("kl_beta", 0.1))
+    
     out = repo_path(output or cfg["output"])
     out.parent.mkdir(parents=True, exist_ok=True)
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    policy = bundle["policy"].to(device)
+    value_model = bundle["value_model"].to(device)
+    reward_model = bundle["reward_model"].to(device)
+    tokenizer = bundle["tokenizer"]
+    pol_opt, val_opt = bundle["policy_optimizer"], bundle["value_optimizer"]
+    
+    ref_policy = load_policy(cfg, adapter_path=cfg["paths"]["ppo_midpoint_policy"], trainable=False).to(device)
+    ref_policy.eval()
+    reward_model.eval()
 
-    raise NotImplementedError(
-        "TODO(student): implement the 20-update PPO continuation from the supplied midpoint. "
-        "Your loop must collect on-policy rollouts, compute old/reference log-probs, learned reward, "
-        "KL-shaped rewards, GAE/returns, policy/value losses, clipping diagnostics, entropy, gradient norms, "
-        "response length, wall-clock time, and peak VRAM. Validate task2_ppo.ppo before running experiments."
-    )
+    print(f"--- Starting PPO: {run_name} | Updates: {total_updates} | Eps: {eps} | Beta: {beta} ---")
+    torch.cuda.reset_peak_memory_stats()
+    
+    from torch.utils.data import DataLoader
+    loader = DataLoader(bundle["prompt_rows"], batch_size=int(cfg["batch_size"]), shuffle=True)
+    loader_iter = iter(loader)
 
+    for update in tqdm(range(total_updates), desc="PPO Updates"):
+        try:
+            batch = next(loader_iter)
+        except StopIteration:
+            loader_iter = iter(loader)
+            batch = next(loader_iter)
+            
+        prompts = [row["prompt"] if isinstance(row, dict) else row for row in batch]
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
+        
+        policy.eval()
+        with torch.no_grad():
+            outputs = policy.generate(
+                **inputs,
+                max_new_tokens=int(cfg["max_sequence_length"]),
+                pad_token_id=tokenizer.eos_token_id,
+                do_sample=True,
+                temperature=0.7
+            )
+            
+        response_mask = (outputs != tokenizer.pad_token_id).float()
+        prompt_lengths = inputs["input_ids"].shape[1]
+        response_mask[:, :prompt_lengths] = 0.0
+
+        with torch.no_grad():
+            reward_outputs = reward_model(input_ids=outputs, attention_mask=(outputs != tokenizer.pad_token_id).long())
+            task_rewards = reward_outputs.squeeze(-1)[:, -1]
+
+            ref_logprobs, _, _ = get_logprobs_and_values(ref_policy, value_model, outputs, (outputs != tokenizer.pad_token_id).long(), response_mask)
+            old_logprobs, old_values, shift_mask = get_logprobs_and_values(policy, value_model, outputs, (outputs != tokenizer.pad_token_id).long(), response_mask)
+            
+            step_rewards = shaped_rewards(task_rewards, old_logprobs, ref_logprobs, shift_mask, beta)
+            advantages, returns = compute_gae(step_rewards, old_values, shift_mask)
+            advantages = normalize_advantages(advantages, shift_mask)
+
+        policy.train()
+        value_model.train()
+        
+        pol_opt.zero_grad()
+        val_opt.zero_grad()
+
+        new_logprobs, new_values, _ = get_logprobs_and_values(policy, value_model, outputs, (outputs != tokenizer.pad_token_id).long(), response_mask)
+        
+        pol_loss, _, clip_frac = ppo_policy_loss(new_logprobs, old_logprobs, advantages, shift_mask, eps)
+        val_loss = value_mse_loss(new_values, returns, shift_mask)
+        
+        loss = pol_loss + 0.1 * val_loss
+        loss.backward()
+        
+        pol_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters(policy), 1.0)
+        
+        pol_opt.step()
+        val_opt.step()
+
+        if update % 5 == 0 or update == total_updates - 1:
+            peak_vram = torch.cuda.max_memory_allocated() / (1024**3)
+            elapsed = time.time() - start_time
+            avg_len = shift_mask.sum(dim=1).mean().item()
+            print(f"Update {update} | Reward: {task_rewards.mean().item():.3f} | Pol Loss: {pol_loss.item():.3f} | Val Loss: {val_loss.item():.3f} | Clip Frac: {clip_frac.item():.3f} | Grad Norm: {pol_grad_norm.item():.3f} | Len: {avg_len:.1f} | VRAM: {peak_vram:.2f}GB | Time: {elapsed:.1f}s")
+
+    policy.save_pretrained(out)
+    print(f"Finished PPO Training. Adapter saved to {out}")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -91,7 +185,6 @@ def main():
     ap.add_argument("--run-name", default="standard")
     args = ap.parse_args()
     run_ppo(args.config, args.output, args.updates, args.clip_epsilon, args.kl_beta, args.run_name)
-
 
 if __name__ == "__main__":
     main()
