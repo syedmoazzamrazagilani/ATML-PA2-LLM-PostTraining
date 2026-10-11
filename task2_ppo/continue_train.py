@@ -18,12 +18,13 @@ from common.models import (
     trainable_parameters,
     value_parameter_groups,
     token_values,
+    clear_gpu,
 )
 from task2_ppo.ppo import compute_gae, shaped_rewards, ppo_policy_loss, value_mse_loss, normalize_advantages
 
 def prepare_ppo_continuation(config_path: str):
     cfg = load_yaml(config_path)
-    set_seed(int(cfg["seed"]))
+    set_seed(int(cfg.get("seed", 42)))
 
     tokenizer = load_tokenizer(cfg["base_model"])
     policy = load_policy(
@@ -41,13 +42,13 @@ def prepare_ppo_continuation(config_path: str):
 
     policy_optimizer = AdamW(
         trainable_parameters(policy),
-        lr=float(cfg["policy_learning_rate"]),
+        lr=float(cfg.get("policy_learning_rate", 1e-5)),
     )
     value_optimizer = AdamW(
         value_parameter_groups(
             value_model,
-            lora_lr=float(cfg["value_lora_learning_rate"]),
-            head_lr=float(cfg["value_head_learning_rate"]),
+            lora_lr=float(cfg.get("value_lora_learning_rate", 1e-5)),
+            head_lr=float(cfg.get("value_head_learning_rate", 5e-5)),
         ),
         weight_decay=0.0,
     )
@@ -66,7 +67,6 @@ def prepare_ppo_continuation(config_path: str):
 
 def get_logprobs_and_values(policy, value_model, input_ids, attention_mask, response_mask):
     logits = policy(input_ids=input_ids, attention_mask=attention_mask).logits
-    
     values = token_values(value_model, input_ids, attention_mask)
     
     shifted_logits = logits[:, :-1, :]
@@ -82,7 +82,7 @@ def get_logprobs_and_values(policy, value_model, input_ids, attention_mask, resp
     shifted_values = values[:, :-1]
     
     return logprobs * shifted_response_mask, shifted_values * shifted_response_mask, shifted_response_mask
-    
+
 def safe_to_device(model, device):
     """Safely moves models to device, bypassing 8-bit quantized models."""
     try:
@@ -99,7 +99,7 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
     eps = clip_epsilon if clip_epsilon is not None else float(cfg.get("clip_epsilon", 0.2))
     beta = kl_beta if kl_beta is not None else float(cfg.get("kl_beta", 0.1))
     
-    out = repo_path(output or cfg["output"])
+    out = repo_path(output or cfg.get("output", "results/ppo_standard"))
     out.parent.mkdir(parents=True, exist_ok=True)
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -119,7 +119,8 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
     print(f"--- Starting PPO: {run_name} | Updates: {total_updates} | Eps: {eps} | Beta: {beta} ---")
     torch.cuda.reset_peak_memory_stats()
     
-    loader = DataLoader(bundle["prompt_rows"], batch_size=int(cfg["prompts_per_update"]), shuffle=True)
+    batch_size = int(cfg.get("prompts_per_update", 1))
+    loader = DataLoader(bundle["prompt_rows"], batch_size=batch_size, shuffle=True)
     loader_iter = iter(loader)
 
     for update in tqdm(range(total_updates), desc="PPO Updates"):
@@ -136,7 +137,7 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
         with torch.no_grad():
             outputs = policy.generate(
                 **inputs,
-                max_new_tokens=int(cfg["max_response_length"]),
+                max_new_tokens=int(cfg.get("max_response_length", 512)),
                 pad_token_id=tokenizer.eos_token_id,
                 do_sample=True,
                 temperature=0.7
@@ -154,8 +155,11 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             old_logprobs, old_values, shift_mask = get_logprobs_and_values(policy, value_model, outputs, (outputs != tokenizer.pad_token_id).long(), response_mask)
             
             step_rewards = shaped_rewards(task_rewards, old_logprobs, ref_logprobs, shift_mask, beta)
-            advantages, returns = compute_gae(step_rewards, old_values, shift_mask, gamma=float(cfg["gamma"]), lam=float(cfg["gae_lambda"]))
+            advantages, returns = compute_gae(step_rewards, old_values, shift_mask, gamma=float(cfg.get("gamma", 1.0)), lam=float(cfg.get("gae_lambda", 0.95)))
             advantages = normalize_advantages(advantages, shift_mask)
+
+        del reward_outputs, step_rewards, ref_logprobs
+        clear_gpu()
 
         policy.train()
         value_model.train()
@@ -165,22 +169,27 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
 
         new_logprobs, new_values, _ = get_logprobs_and_values(policy, value_model, outputs, (outputs != tokenizer.pad_token_id).long(), response_mask)
         
-        pol_loss, _, clip_frac = ppo_policy_loss(new_logprobs, old_logprobs, advantages, shift_mask, eps)
-        val_loss = value_mse_loss(new_values, returns, shift_mask)
+        pol_loss, _, clip_frac = ppo_policy_loss(new_logprobs, old_logprobs.detach(), advantages.detach(), shift_mask, eps)
+        val_loss = value_mse_loss(new_values, returns.detach(), shift_mask)
         
-        loss = pol_loss + float(cfg["value_coef"]) * val_loss
+        loss = pol_loss + float(cfg.get("value_coef", 0.5)) * val_loss
         loss.backward()
         
-        pol_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters(policy), 1.0)
+        max_grad = float(cfg.get("max_grad_norm", 1.0))
+        pol_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters(policy), max_grad)
+        val_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters(value_model), max_grad)
         
         pol_opt.step()
         val_opt.step()
+        
+        del new_logprobs, new_values, loss, pol_loss, val_loss
+        clear_gpu()
 
         if update % 5 == 0 or update == total_updates - 1:
             peak_vram = torch.cuda.max_memory_allocated() / (1024**3)
             elapsed = time.time() - start_time
             avg_len = shift_mask.sum(dim=1).mean().item()
-            print(f"Update {update} | Reward: {task_rewards.mean().item():.3f} | Pol Loss: {pol_loss.item():.3f} | Val Loss: {val_loss.item():.3f} | Clip Frac: {clip_frac.item():.3f} | Grad Norm: {pol_grad_norm.item():.3f} | Len: {avg_len:.1f} | VRAM: {peak_vram:.2f}GB | Time: {elapsed:.1f}s")
+            print(f"Update {update} | Reward: {task_rewards.mean().item():.3f} | Pol Loss: {pol_grad_norm.item():.3f} | Val Loss: {val_grad_norm.item():.3f} | Clip: {clip_frac.item():.3f} | Len: {avg_len:.1f} | VRAM: {peak_vram:.2f}GB | Time: {elapsed:.1f}s")
 
     policy.save_pretrained(out)
     print(f"Finished PPO Training. Adapter saved to {out}")
