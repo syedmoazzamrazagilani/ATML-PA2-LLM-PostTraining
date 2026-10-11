@@ -46,12 +46,22 @@ def main():
     
     for row in tqdm(bundle["rows"]):
         prompt = prompt_messages_from_preference(row)
-        encoded = tokenizer.apply_chat_template(prompt, return_tensors="pt", add_generation_prompt=True).to(device)
+        
+        inputs = tokenizer.apply_chat_template(
+            prompt, 
+            return_dict=True, 
+            return_tensors="pt", 
+            add_generation_prompt=True
+        ).to(device)
         
         with torch.no_grad():
-            outputs = model.generate(encoded, max_new_tokens=int(cfg["max_sequence_length"]))
+            outputs = model.generate(
+                **inputs, 
+                max_new_tokens=int(cfg["max_sequence_length"]),
+                pad_token_id=tokenizer.eos_token_id
+            )
             
-        generated_tokens = outputs[0][encoded.shape[1]:]
+        generated_tokens = outputs[0][inputs["input_ids"].shape[1]:]
         total_length += len(generated_tokens)
         
         response_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
