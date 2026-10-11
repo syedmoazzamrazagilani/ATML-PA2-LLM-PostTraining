@@ -28,15 +28,8 @@ def make_collate(tokenizer, max_length):
         for row in rows:
             prompt = prompt_messages_from_preference(row)
             yc, yr = preference_responses(row)
-            try:
-                chosen.append(encode_prompt_response(tokenizer, prompt, yc, max_length))
-                rejected.append(encode_prompt_response(tokenizer, prompt, yr, max_length))
-            except ValueError:
-                continue
-                
-        if not chosen:
-            return None, None
-            
+            chosen.append(encode_prompt_response(tokenizer, prompt, yc, max_length))
+            rejected.append(encode_prompt_response(tokenizer, prompt, yr, max_length))
         return pad_batch(tokenizer, chosen), pad_batch(tokenizer, rejected)
     return collate
 
@@ -78,9 +71,11 @@ def get_response_logps(model, batch, device):
     
     logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
     
+    # Shift sequence for next-token prediction
     shifted_logits = logits[:, :-1, :]
     shifted_labels = input_ids[:, 1:]
     
+    # If labels exist and use -100 for prompts, use them to mask. Otherwise fallback to attention mask.
     if "labels" in batch:
         mask = (batch["labels"][:, 1:] != -100).to(logits.dtype)
     else:
@@ -105,6 +100,7 @@ def run_training(config_path: str, run_name: str, dataset_path: str | None = Non
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     
+    # Load frozen reference model
     ref_model = load_policy(cfg, trainable=False)
     ref_model.to(device)
     ref_model.eval()
@@ -114,11 +110,7 @@ def run_training(config_path: str, run_name: str, dataset_path: str | None = Non
     print(f"Starting DPO Training: {run_name} | Beta: {beta_val} | Device: {device}")
     
     for epoch in range(int(cfg.get("epochs", 1))):
-        for batch_data in tqdm(loader, desc=f"Epoch {epoch+1}"):
-            if batch_data[0] is None:
-                continue
-                
-            chosen_batch, rejected_batch = batch_data
+        for chosen_batch, rejected_batch in tqdm(loader, desc=f"Epoch {epoch+1}"):
             
             with torch.no_grad():
                 ref_chosen_logps = get_response_logps(ref_model, chosen_batch, device)
