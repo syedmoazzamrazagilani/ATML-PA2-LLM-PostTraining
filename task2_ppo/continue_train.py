@@ -64,7 +64,6 @@ def prepare_ppo_continuation(config_path: str):
     }
 
 def get_logprobs_and_values(policy, value_model, input_ids, attention_mask, response_mask):
-    """Helper to extract logprobs and values for the generated response."""
     logits = policy(input_ids=input_ids, attention_mask=attention_mask).logits
     values = value_model(input_ids=input_ids, attention_mask=attention_mask).squeeze(-1)
     
@@ -82,6 +81,13 @@ def get_logprobs_and_values(policy, value_model, input_ids, attention_mask, resp
     
     return logprobs * shifted_response_mask, shifted_values * shifted_response_mask, shifted_response_mask
 
+def safe_to_device(model, device):
+    """Safely moves models to device, bypassing 8-bit quantized models."""
+    try:
+        return model.to(device)
+    except ValueError:
+        return model
+
 def run_ppo(config_path: str, output: str | None = None, updates: int | None = None, clip_epsilon: float | None = None, kl_beta: float | None = None, run_name: str = "standard"):
     start_time = time.time()
     bundle = prepare_ppo_continuation(config_path)
@@ -95,20 +101,22 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
     out.parent.mkdir(parents=True, exist_ok=True)
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    policy = bundle["policy"].to(device)
-    value_model = bundle["value_model"].to(device)
-    reward_model = bundle["reward_model"].to(device)
+    
+    policy = safe_to_device(bundle["policy"], device)
+    value_model = safe_to_device(bundle["value_model"], device)
+    reward_model = safe_to_device(bundle["reward_model"], device)
     tokenizer = bundle["tokenizer"]
     pol_opt, val_opt = bundle["policy_optimizer"], bundle["value_optimizer"]
     
-    ref_policy = load_policy(cfg, adapter_path=cfg["paths"]["ppo_midpoint_policy"], trainable=False).to(device)
+    ref_policy = load_policy(cfg, adapter_path=cfg["paths"]["ppo_midpoint_policy"], trainable=False)
+    ref_policy = safe_to_device(ref_policy, device)
+    
     ref_policy.eval()
     reward_model.eval()
 
     print(f"--- Starting PPO: {run_name} | Updates: {total_updates} | Eps: {eps} | Beta: {beta} ---")
     torch.cuda.reset_peak_memory_stats()
     
-    from torch.utils.data import DataLoader
     loader = DataLoader(bundle["prompt_rows"], batch_size=int(cfg["batch_size"]), shuffle=True)
     loader_iter = iter(loader)
 
