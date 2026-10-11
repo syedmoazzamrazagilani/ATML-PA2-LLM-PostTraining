@@ -72,16 +72,17 @@ def get_logprobs_and_values(policy, value_model, input_ids, attention_mask, resp
     shifted_logits = logits[:, :-1, :]
     shifted_labels = input_ids[:, 1:]
     
-    logprobs = torch.gather(
-        F.log_softmax(shifted_logits, dim=-1), 
-        dim=2, 
-        index=shifted_labels.unsqueeze(2)
-    ).squeeze(-1)
+    log_probs = F.log_softmax(shifted_logits.float(), dim=-1)
+    
+    probs = torch.exp(log_probs)
+    entropy = -torch.sum(probs * log_probs, dim=-1)
+    
+    logprobs = torch.gather(log_probs, dim=2, index=shifted_labels.unsqueeze(2)).squeeze(-1)
     
     shifted_response_mask = response_mask[:, 1:]
     shifted_values = values[:, :-1]
     
-    return logprobs * shifted_response_mask, shifted_values * shifted_response_mask, shifted_response_mask
+    return logprobs * shifted_response_mask, shifted_values * shifted_response_mask, shifted_response_mask, entropy * shifted_response_mask
 
 def safe_to_device(model, device):
     """Safely moves models to device, bypassing 8-bit quantized models."""
@@ -149,13 +150,13 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
 
         with torch.no_grad():
             reward_outputs = reward_model(input_ids=outputs, attention_mask=(outputs != tokenizer.pad_token_id).long())
-            task_rewards = reward_outputs.logits.squeeze(-1)
+            task_rewards = reward_outputs.logits.squeeze(-1).float()
 
-            ref_logprobs, _, _ = get_logprobs_and_values(ref_policy, value_model, outputs, (outputs != tokenizer.pad_token_id).long(), response_mask)
-            old_logprobs, old_values, shift_mask = get_logprobs_and_values(policy, value_model, outputs, (outputs != tokenizer.pad_token_id).long(), response_mask)
+            ref_logprobs, _, _, _ = get_logprobs_and_values(ref_policy, value_model, outputs, (outputs != tokenizer.pad_token_id).long(), response_mask)
+            old_logprobs, old_values, shift_mask, _ = get_logprobs_and_values(policy, value_model, outputs, (outputs != tokenizer.pad_token_id).long(), response_mask)
             
-            step_rewards = shaped_rewards(task_rewards, old_logprobs, ref_logprobs, shift_mask, beta)
-            advantages, returns = compute_gae(step_rewards, old_values, shift_mask, gamma=float(cfg.get("gamma", 1.0)), lam=float(cfg.get("gae_lambda", 0.95)))
+            step_rewards = shaped_rewards(task_rewards, old_logprobs.float(), ref_logprobs.float(), shift_mask, beta)
+            advantages, returns = compute_gae(step_rewards, old_values.float(), shift_mask, gamma=float(cfg.get("gamma", 1.0)), lam=float(cfg.get("gae_lambda", 0.95)))
             advantages = normalize_advantages(advantages, shift_mask)
 
         del reward_outputs, step_rewards, ref_logprobs
@@ -164,32 +165,37 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
         policy.train()
         value_model.train()
         
-        pol_opt.zero_grad()
-        val_opt.zero_grad()
-
-        new_logprobs, new_values, _ = get_logprobs_and_values(policy, value_model, outputs, (outputs != tokenizer.pad_token_id).long(), response_mask)
-        
-        pol_loss, _, clip_frac = ppo_policy_loss(new_logprobs, old_logprobs.detach(), advantages.detach(), shift_mask, eps)
-        val_loss = value_mse_loss(new_values, returns.detach(), shift_mask)
-        
-        loss = pol_loss + float(cfg.get("value_coef", 0.5)) * val_loss
-        loss.backward()
-        
+        ppo_epochs = int(cfg.get("ppo_epochs", 2))
         max_grad = float(cfg.get("max_grad_norm", 1.0))
-        pol_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters(policy), max_grad)
-        val_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters(value_model), max_grad)
         
-        pol_opt.step()
-        val_opt.step()
-        
-        del new_logprobs, new_values, loss, pol_loss, val_loss
-        clear_gpu()
+        for epoch_idx in range(ppo_epochs):
+            pol_opt.zero_grad()
+            val_opt.zero_grad()
+
+            new_logprobs, new_values, _, entropy_mask = get_logprobs_and_values(policy, value_model, outputs, (outputs != tokenizer.pad_token_id).long(), response_mask)
+            
+            pol_loss, _, clip_frac = ppo_policy_loss(new_logprobs.float(), old_logprobs.detach().float(), advantages.detach().float(), shift_mask, eps)
+            val_loss = value_mse_loss(new_values.float(), returns.detach().float(), shift_mask)
+            
+            loss = pol_loss + float(cfg.get("value_coef", 0.5)) * val_loss
+            loss.backward()
+            
+            pol_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters(policy), max_grad)
+            val_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters(value_model), max_grad)
+            
+            pol_opt.step()
+            val_opt.step()
+            
+            del new_logprobs, new_values, loss, pol_loss, val_loss
+            clear_gpu()
+
+        mean_entropy = (entropy_mask.sum() / shift_mask.sum()).item()
 
         if update % 5 == 0 or update == total_updates - 1:
             peak_vram = torch.cuda.max_memory_allocated() / (1024**3)
             elapsed = time.time() - start_time
             avg_len = shift_mask.sum(dim=1).mean().item()
-            print(f"Update {update} | Reward: {task_rewards.mean().item():.3f} | Pol Loss: {pol_grad_norm.item():.3f} | Val Loss: {val_grad_norm.item():.3f} | Clip: {clip_frac.item():.3f} | Len: {avg_len:.1f} | VRAM: {peak_vram:.2f}GB | Time: {elapsed:.1f}s")
+            print(f"Up {update} | Rew: {task_rewards.mean().item():.2f} | PolLoss: {pol_grad_norm.item():.2f} | ValLoss: {val_grad_norm.item():.2f} | Clip: {clip_frac.item():.3f} | Ent: {mean_entropy:.2f} | Len: {avg_len:.0f} | VRAM: {peak_vram:.2f}GB | {elapsed:.0f}s")
 
     policy.save_pretrained(out)
     print(f"Finished PPO Training. Adapter saved to {out}")
