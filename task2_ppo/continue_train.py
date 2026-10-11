@@ -17,6 +17,7 @@ from common.models import (
     load_value_model,
     trainable_parameters,
     value_parameter_groups,
+    token_values,
 )
 from task2_ppo.ppo import compute_gae, shaped_rewards, ppo_policy_loss, value_mse_loss, normalize_advantages
 
@@ -65,7 +66,8 @@ def prepare_ppo_continuation(config_path: str):
 
 def get_logprobs_and_values(policy, value_model, input_ids, attention_mask, response_mask):
     logits = policy(input_ids=input_ids, attention_mask=attention_mask).logits
-    values = value_model(input_ids=input_ids, attention_mask=attention_mask).squeeze(-1)
+    
+    values = token_values(value_model, input_ids, attention_mask)
     
     shifted_logits = logits[:, :-1, :]
     shifted_labels = input_ids[:, 1:]
@@ -80,7 +82,7 @@ def get_logprobs_and_values(policy, value_model, input_ids, attention_mask, resp
     shifted_values = values[:, :-1]
     
     return logprobs * shifted_response_mask, shifted_values * shifted_response_mask, shifted_response_mask
-
+    
 def safe_to_device(model, device):
     """Safely moves models to device, bypassing 8-bit quantized models."""
     try:
@@ -146,7 +148,7 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
 
         with torch.no_grad():
             reward_outputs = reward_model(input_ids=outputs, attention_mask=(outputs != tokenizer.pad_token_id).long())
-            task_rewards = reward_outputs.squeeze(-1)[:, -1]
+            task_rewards = reward_outputs.logits.squeeze(-1)
 
             ref_logprobs, _, _ = get_logprobs_and_values(ref_policy, value_model, outputs, (outputs != tokenizer.pad_token_id).long(), response_mask)
             old_logprobs, old_values, shift_mask = get_logprobs_and_values(policy, value_model, outputs, (outputs != tokenizer.pad_token_id).long(), response_mask)
