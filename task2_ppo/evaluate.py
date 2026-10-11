@@ -19,6 +19,13 @@ def load_evaluation_bundle(config_path: str, adapter: str):
         "reward": load_reward_model(cfg),
     }
 
+def safe_to_device(model, device):
+    """Safely moves models to device, bypassing 8-bit quantized models."""
+    try:
+        return model.to(device)
+    except ValueError:
+        return model
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/ppo.yaml")
@@ -30,7 +37,7 @@ def main():
     tokenizer, model, cfg = bundle["tokenizer"], bundle["policy"], bundle["cfg"]
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
+    model = safe_to_device(model, device)
     model.eval()
     
     print(f"Evaluating {args.adapter} on {len(bundle['rows'])} rows...")
