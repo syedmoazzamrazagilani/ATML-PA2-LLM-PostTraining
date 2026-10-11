@@ -28,8 +28,15 @@ def make_collate(tokenizer, max_length):
         for row in rows:
             prompt = prompt_messages_from_preference(row)
             yc, yr = preference_responses(row)
-            chosen.append(encode_prompt_response(tokenizer, prompt, yc, max_length))
-            rejected.append(encode_prompt_response(tokenizer, prompt, yr, max_length))
+            try:
+                chosen.append(encode_prompt_response(tokenizer, prompt, yc, max_length))
+                rejected.append(encode_prompt_response(tokenizer, prompt, yr, max_length))
+            except ValueError:
+                continue
+                
+        if not chosen:
+            return None, None
+            
         return pad_batch(tokenizer, chosen), pad_batch(tokenizer, rejected)
     return collate
 
@@ -107,7 +114,11 @@ def run_training(config_path: str, run_name: str, dataset_path: str | None = Non
     print(f"Starting DPO Training: {run_name} | Beta: {beta_val} | Device: {device}")
     
     for epoch in range(int(cfg.get("epochs", 1))):
-        for chosen_batch, rejected_batch in tqdm(loader, desc=f"Epoch {epoch+1}"):
+        for batch_data in tqdm(loader, desc=f"Epoch {epoch+1}"):
+            if batch_data[0] is None:
+                continue
+                
+            chosen_batch, rejected_batch = batch_data
             
             with torch.no_grad():
                 ref_chosen_logps = get_response_logps(ref_model, chosen_batch, device)
