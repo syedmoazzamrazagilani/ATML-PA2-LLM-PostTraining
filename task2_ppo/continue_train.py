@@ -117,7 +117,7 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
     print(f"--- Starting PPO: {run_name} | Updates: {total_updates} | Eps: {eps} | Beta: {beta} ---")
     torch.cuda.reset_peak_memory_stats()
     
-    loader = DataLoader(bundle["prompt_rows"], batch_size=int(cfg["batch_size"]), shuffle=True)
+    loader = DataLoader(bundle["prompt_rows"], batch_size=int(cfg["prompts_per_update"]), shuffle=True)
     loader_iter = iter(loader)
 
     for update in tqdm(range(total_updates), desc="PPO Updates"):
@@ -134,7 +134,7 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
         with torch.no_grad():
             outputs = policy.generate(
                 **inputs,
-                max_new_tokens=int(cfg["max_sequence_length"]),
+                max_new_tokens=int(cfg["max_response_length"]),
                 pad_token_id=tokenizer.eos_token_id,
                 do_sample=True,
                 temperature=0.7
@@ -152,7 +152,7 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             old_logprobs, old_values, shift_mask = get_logprobs_and_values(policy, value_model, outputs, (outputs != tokenizer.pad_token_id).long(), response_mask)
             
             step_rewards = shaped_rewards(task_rewards, old_logprobs, ref_logprobs, shift_mask, beta)
-            advantages, returns = compute_gae(step_rewards, old_values, shift_mask)
+            advantages, returns = compute_gae(step_rewards, old_values, shift_mask, gamma=float(cfg["gamma"]), lam=float(cfg["gae_lambda"]))
             advantages = normalize_advantages(advantages, shift_mask)
 
         policy.train()
@@ -166,7 +166,7 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
         pol_loss, _, clip_frac = ppo_policy_loss(new_logprobs, old_logprobs, advantages, shift_mask, eps)
         val_loss = value_mse_loss(new_values, returns, shift_mask)
         
-        loss = pol_loss + 0.1 * val_loss
+        loss = pol_loss + float(cfg["value_coef"]) * val_loss
         loss.backward()
         
         pol_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters(policy), 1.0)
