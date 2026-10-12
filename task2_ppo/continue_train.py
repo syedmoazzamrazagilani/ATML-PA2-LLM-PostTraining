@@ -41,15 +41,6 @@ def prepare_ppo_continuation(config_path: str):
     reward_model, reward_tokenizer = load_reward_model(cfg)
     prompts = read_jsonl(cfg["paths"]["rl_prompt_train"])
 
-    # ==== THE ADAMW FP16 LIFESAVER ====
-    # Force all trainable weights to FP32 so AdamW's epsilon (1e-8) doesn't round to 0.0 in FP16,
-    # completely preventing the division-by-zero NaN gradient explosion.
-    for p in trainable_parameters(policy):
-        p.data = p.data.float()
-    for p in trainable_parameters(value_model):
-        p.data = p.data.float()
-    # ==================================
-
     policy_optimizer = AdamW(
         trainable_parameters(policy),
         lr=float(cfg.get("policy_learning_rate", 1e-5)),
@@ -81,18 +72,13 @@ def get_logprobs(policy, input_ids, attention_mask, response_mask):
     shifted_labels = input_ids[:, 1:]
     
     logprobs = -F.cross_entropy(shifted_logits.transpose(1, 2), shifted_labels, reduction="none")
-    shifted_response_mask = response_mask[:, 1:].bool()
-    
-    logprobs = torch.where(shifted_response_mask, logprobs, 0.0)
-    return logprobs, shifted_response_mask.float()
+    shift_mask = response_mask[:, 1:].float()
+    return logprobs * shift_mask, shift_mask
 
 def get_values(value_model, input_ids, attention_mask, response_mask):
     values = token_values(value_model, input_ids, attention_mask).float()
-    shifted_values = values[:, :-1]
-    shifted_response_mask = response_mask[:, 1:].bool()
-    
-    shifted_values = torch.where(shifted_response_mask, shifted_values, 0.0)
-    return shifted_values
+    shift_mask = response_mask[:, 1:].float()
+    return values[:, :-1] * shift_mask
 
 def safe_to_device(model, device):
     try:
@@ -121,6 +107,9 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
     pol_opt, val_opt = bundle["policy_optimizer"], bundle["value_optimizer"]
     
     reward_model.eval()
+
+    # The ultimate fix: PyTorch AMP Scaler to intercept FP16 NaN explosions
+    scaler = torch.cuda.amp.GradScaler()
 
     print(f"--- Starting PPO: {run_name} | Updates: {total_updates} | Eps: {eps} | Beta: {beta} ---")
     torch.cuda.reset_peak_memory_stats()
@@ -158,6 +147,11 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
         with torch.no_grad():
             reward_outputs = reward_model(input_ids=outputs, attention_mask=attention_mask)
             task_rewards = reward_outputs.logits.squeeze(-1).float()
+            
+            # Apply missing_eos_penalty exactly as expected by your config
+            has_eos = (outputs == tokenizer.eos_token_id).any(dim=-1)
+            task_rewards = torch.where(has_eos, task_rewards, task_rewards - float(cfg.get("missing_eos_penalty", 1.0)))
+            
             del reward_outputs
             clear_gpu()
 
@@ -168,13 +162,9 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             old_logprobs, shift_mask = get_logprobs(policy, outputs, attention_mask, response_mask)
             old_values = get_values(value_model, outputs, attention_mask, response_mask)
             
-            step_rewards = shaped_rewards(task_rewards, old_logprobs.float(), ref_logprobs.float(), shift_mask, beta)
-            step_rewards = torch.where(shift_mask.bool(), step_rewards, 0.0)
-            
-            advantages, returns = compute_gae(step_rewards, old_values.float(), shift_mask, gamma=float(cfg.get("gamma", 1.0)), lam=float(cfg.get("gae_lambda", 0.95)))
+            step_rewards = shaped_rewards(task_rewards, old_logprobs, ref_logprobs, shift_mask, beta)
+            advantages, returns = compute_gae(step_rewards, old_values, shift_mask, gamma=float(cfg.get("gamma", 1.0)), lam=float(cfg.get("gae_lambda", 0.95)))
             advantages = normalize_advantages(advantages, shift_mask)
-            advantages = torch.where(shift_mask.bool(), advantages, 0.0)
-            returns = torch.where(shift_mask.bool(), returns, 0.0)
 
         del ref_logprobs, step_rewards, old_values
         clear_gpu()
@@ -189,33 +179,41 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             pol_opt.zero_grad()
             val_opt.zero_grad()
 
-            new_logprobs, _ = get_logprobs(policy, outputs, attention_mask, response_mask)
-            new_values = get_values(value_model, outputs, attention_mask, response_mask)
+            # Execute forward/loss passes within the safety of the AMP context
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                new_logprobs, _ = get_logprobs(policy, outputs, attention_mask, response_mask)
+                new_values = get_values(value_model, outputs, attention_mask, response_mask)
+                
+                pol_loss, _, clip_frac = ppo_policy_loss(new_logprobs, old_logprobs.detach(), advantages.detach(), shift_mask, eps)
+                val_loss = value_mse_loss(new_values, returns.detach(), shift_mask)
+                loss = pol_loss + float(cfg.get("value_coef", 0.5)) * val_loss
+
+            # Scaler prevents NaNs from destroying the gradients
+            scaler.scale(loss).backward()
             
-            entropy_mask = (-new_logprobs).detach()
-            
-            pol_loss, _, clip_frac = ppo_policy_loss(new_logprobs.float(), old_logprobs.detach().float(), advantages.detach().float(), shift_mask, eps)
-            val_loss = value_mse_loss(new_values.float(), returns.detach().float(), shift_mask)
-            
-            loss = pol_loss + float(cfg.get("value_coef", 0.5)) * val_loss
-            loss.backward()
+            # Unscale before clipping so gradient norms are accurate
+            scaler.unscale_(pol_opt)
+            scaler.unscale_(val_opt)
             
             pol_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters(policy), max_grad)
             val_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters(value_model), max_grad)
             
-            pol_opt.step()
-            val_opt.step()
+            scaler.step(pol_opt)
+            scaler.step(val_opt)
+            scaler.update()
             
+            entropy_mask = (-new_logprobs).detach()
             del new_logprobs, new_values, loss, pol_loss, val_loss
             clear_gpu()
 
         mean_entropy = (entropy_mask.sum() / shift_mask.sum()).item()
+        val_gn_print = val_grad_norm.item() if not torch.isnan(val_grad_norm) else 0.0
 
         if update % 5 == 0 or update == total_updates - 1:
             peak_vram = torch.cuda.max_memory_allocated() / (1024**3)
             elapsed = time.time() - start_time
             avg_len = shift_mask.sum(dim=1).mean().item()
-            print(f"Up {update} | Rew: {task_rewards.mean().item():.2f} | PolLoss: {pol_grad_norm.item():.2f} | ValLoss: {val_grad_norm.item():.2f} | Clip: {clip_frac.item():.3f} | Ent: {mean_entropy:.2f} | Len: {avg_len:.0f} | VRAM: {peak_vram:.2f}GB | {elapsed:.0f}s")
+            print(f"Up {update} | Rew: {task_rewards.mean().item():.2f} | PolLoss: {pol_grad_norm.item():.2f} | ValLoss: {val_gn_print:.2f} | Clip: {clip_frac.item():.3f} | Ent: {mean_entropy:.2f} | Len: {avg_len:.0f} | VRAM: {peak_vram:.2f}GB | {elapsed:.0f}s")
 
     policy.save_pretrained(out)
     print(f"Finished PPO Training. Adapter saved to {out}")
