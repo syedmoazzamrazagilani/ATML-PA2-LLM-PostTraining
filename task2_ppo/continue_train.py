@@ -67,23 +67,28 @@ def prepare_ppo_continuation(config_path: str):
     }
 
 def get_logprobs(policy, input_ids, attention_mask, response_mask):
-    """Memory-safe logprob extraction using CrossEntropy trick."""
     logits = policy(input_ids=input_ids, attention_mask=attention_mask).logits
-    shifted_logits = logits[:, :-1, :]
+    shifted_logits = logits[:, :-1, :].float()
     shifted_labels = input_ids[:, 1:]
     
-    # Mathematical equivalent of gather(log_softmax), but bypasses the massive VRAM allocation
     logprobs = -F.cross_entropy(shifted_logits.transpose(1, 2), shifted_labels, reduction="none")
     
-    shifted_response_mask = response_mask[:, 1:]
-    return logprobs * shifted_response_mask, shifted_response_mask
+    shifted_response_mask = response_mask[:, 1:].bool()
+    
+    # FIXED: Use torch.where to safely eliminate NaN gradients at padding positions
+    logprobs = torch.where(shifted_response_mask, logprobs, 0.0)
+    
+    return logprobs, shifted_response_mask.float()
 
 def get_values(value_model, input_ids, attention_mask, response_mask):
-    """Memory-safe value extraction."""
-    values = token_values(value_model, input_ids, attention_mask)
+    values = token_values(value_model, input_ids, attention_mask).float()
     shifted_values = values[:, :-1]
-    shifted_response_mask = response_mask[:, 1:]
-    return shifted_values * shifted_response_mask
+    shifted_response_mask = response_mask[:, 1:].bool()
+    
+    # FIXED: Use torch.where to safely eliminate NaN gradients at padding positions
+    shifted_values = torch.where(shifted_response_mask, shifted_values, 0.0)
+    
+    return shifted_values
 
 def safe_to_device(model, device):
     try:
@@ -147,26 +152,29 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
         response_mask[:, :prompt_lengths] = 0.0
 
         with torch.no_grad():
-            # 1. Reward pass
             reward_outputs = reward_model(input_ids=outputs, attention_mask=attention_mask)
             task_rewards = reward_outputs.logits.squeeze(-1).float()
             del reward_outputs
             clear_gpu()
 
-            # 2. Reference pass -- same weights as the policy, LoRA adapter disabled via
-            # reference_mode(), instead of a second loaded copy of the 1.5B model.
             with reference_mode(policy):
                 ref_logprobs, _ = get_logprobs(policy, outputs, attention_mask, response_mask)
             clear_gpu()
             
-            # 3. Old Policy & Value pass
             old_logprobs, shift_mask = get_logprobs(policy, outputs, attention_mask, response_mask)
             old_values = get_values(value_model, outputs, attention_mask, response_mask)
             
-            # 4. Math calculations
             step_rewards = shaped_rewards(task_rewards, old_logprobs.float(), ref_logprobs.float(), shift_mask, beta)
+            
+            # FIXED: Safeguard intermediate math
+            step_rewards = torch.where(shift_mask.bool(), step_rewards, 0.0)
+            
             advantages, returns = compute_gae(step_rewards, old_values.float(), shift_mask, gamma=float(cfg.get("gamma", 1.0)), lam=float(cfg.get("gae_lambda", 0.95)))
             advantages = normalize_advantages(advantages, shift_mask)
+            
+            # FIXED: Safeguard normalized tensors before they enter the loss functions
+            advantages = torch.where(shift_mask.bool(), advantages, 0.0)
+            returns = torch.where(shift_mask.bool(), returns, 0.0)
 
         del ref_logprobs, step_rewards, old_values
         clear_gpu()
@@ -184,8 +192,6 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             new_logprobs, _ = get_logprobs(policy, outputs, attention_mask, response_mask)
             new_values = get_values(value_model, outputs, attention_mask, response_mask)
             
-            # Unbiased Monte Carlo estimate for entropy directly from logprobs
-            # (detached: this is a logging-only quantity, it should never carry a graph)
             entropy_mask = (-new_logprobs).detach()
             
             pol_loss, _, clip_frac = ppo_policy_loss(new_logprobs.float(), old_logprobs.detach().float(), advantages.detach().float(), shift_mask, eps)
