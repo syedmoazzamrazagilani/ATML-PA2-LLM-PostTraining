@@ -29,14 +29,11 @@ def make_collate(tokenizer, max_length):
             prompt = prompt_messages_from_preference(row)
             yc, yr = preference_responses(row)
             try:
-                # Attempt to encode; this throws a ValueError if it exceeds max_length
                 chosen.append(encode_prompt_response(tokenizer, prompt, yc, max_length))
                 rejected.append(encode_prompt_response(tokenizer, prompt, yr, max_length))
             except ValueError:
-                # Filter out examples that are too long for the configuration
                 continue
                 
-        # Handle the case where all examples in a batch were filtered out
         if not chosen:
             return None, None
             
@@ -81,14 +78,10 @@ def get_response_logps(model, batch, device):
     
     logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
     
-    # Shift sequence for next-token prediction
     shifted_logits = logits[:, :-1, :]
     shifted_labels = input_ids[:, 1:]
     
-    if "labels" in batch:
-        mask = (batch["labels"][:, 1:] != -100).to(logits.dtype)
-    else:
-        mask = attention_mask[:, 1:].to(logits.dtype)
+    mask = batch["response_mask"][:, 1:].to(logits.dtype).to(device)
         
     per_token_logps = torch.gather(
         F.log_softmax(shifted_logits, dim=-1), 
@@ -103,24 +96,25 @@ def run_training(config_path: str, run_name: str, dataset_path: str | None = Non
     cfg, model, optimizer, loader = bundle["cfg"], bundle["model"], bundle["optimizer"], bundle["loader"]
     beta_val = bundle["beta"]
     
+    grad_accum_steps = int(cfg.get("grad_accum_steps", 8))
+    
     output = repo_path(output_path or cfg["standard_output"])
     output.parent.mkdir(parents=True, exist_ok=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model.to(device)
     
-    # Load frozen reference model
     ref_model = load_policy(cfg, trainable=False)
     ref_model.to(device)
     ref_model.eval()
 
     model.train()
     
-    print(f"Starting DPO Training: {run_name} | Beta: {beta_val} | Device: {device}")
+    print(f"Starting DPO Training: {run_name} | Beta: {beta_val} | Accumulation: {grad_accum_steps} | Device: {device}")
     
     for epoch in range(int(cfg.get("epochs", 1))):
-        for batch_data in tqdm(loader, desc=f"Epoch {epoch+1}"):
-            # Skip iterations where collate filtered the entire batch
+        optimizer.zero_grad()
+        for step, batch_data in enumerate(tqdm(loader, desc=f"Epoch {epoch+1}")):
             if batch_data[0] is None:
                 continue
                 
@@ -141,9 +135,12 @@ def run_training(config_path: str, run_name: str, dataset_path: str | None = Non
                 beta_val
             )
             
-            optimizer.zero_grad()
+            loss = loss / grad_accum_steps
             loss.backward()
-            optimizer.step()
+            
+            if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(loader):
+                optimizer.step()
+                optimizer.zero_grad()
             
     print(f"Saving adapter to {output}")
     model.save_pretrained(output)
