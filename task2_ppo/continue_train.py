@@ -41,6 +41,15 @@ def prepare_ppo_continuation(config_path: str):
     reward_model, reward_tokenizer = load_reward_model(cfg)
     prompts = read_jsonl(cfg["paths"]["rl_prompt_train"])
 
+    # ==== THE ADAMW FP16 LIFESAVER ====
+    # Force all trainable weights to FP32 so AdamW's epsilon (1e-8) doesn't round to 0.0 in FP16,
+    # completely preventing the division-by-zero NaN gradient explosion.
+    for p in trainable_parameters(policy):
+        p.data = p.data.float()
+    for p in trainable_parameters(value_model):
+        p.data = p.data.float()
+    # ==================================
+
     policy_optimizer = AdamW(
         trainable_parameters(policy),
         lr=float(cfg.get("policy_learning_rate", 1e-5)),
@@ -72,12 +81,9 @@ def get_logprobs(policy, input_ids, attention_mask, response_mask):
     shifted_labels = input_ids[:, 1:]
     
     logprobs = -F.cross_entropy(shifted_logits.transpose(1, 2), shifted_labels, reduction="none")
-    
     shifted_response_mask = response_mask[:, 1:].bool()
     
-    # FIXED: Use torch.where to safely eliminate NaN gradients at padding positions
     logprobs = torch.where(shifted_response_mask, logprobs, 0.0)
-    
     return logprobs, shifted_response_mask.float()
 
 def get_values(value_model, input_ids, attention_mask, response_mask):
@@ -85,9 +91,7 @@ def get_values(value_model, input_ids, attention_mask, response_mask):
     shifted_values = values[:, :-1]
     shifted_response_mask = response_mask[:, 1:].bool()
     
-    # FIXED: Use torch.where to safely eliminate NaN gradients at padding positions
     shifted_values = torch.where(shifted_response_mask, shifted_values, 0.0)
-    
     return shifted_values
 
 def safe_to_device(model, device):
@@ -165,14 +169,10 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             old_values = get_values(value_model, outputs, attention_mask, response_mask)
             
             step_rewards = shaped_rewards(task_rewards, old_logprobs.float(), ref_logprobs.float(), shift_mask, beta)
-            
-            # FIXED: Safeguard intermediate math
             step_rewards = torch.where(shift_mask.bool(), step_rewards, 0.0)
             
             advantages, returns = compute_gae(step_rewards, old_values.float(), shift_mask, gamma=float(cfg.get("gamma", 1.0)), lam=float(cfg.get("gae_lambda", 0.95)))
             advantages = normalize_advantages(advantages, shift_mask)
-            
-            # FIXED: Safeguard normalized tensors before they enter the loss functions
             advantages = torch.where(shift_mask.bool(), advantages, 0.0)
             returns = torch.where(shift_mask.bool(), returns, 0.0)
 
