@@ -36,10 +36,13 @@ def compute_gae(rewards, values, mask, gamma=1.0, lam=0.95):
 def shaped_rewards(task_reward, policy_logp, ref_logp, response_mask, beta_kl):
     """Sampled-action KL shaping plus terminal learned reward."""
     rewards = -float(beta_kl) * (policy_logp - ref_logp) * response_mask
+    
     for b in range(rewards.shape[0]):
-        valid = int(response_mask[b].sum().item())
-        if valid > 0:
-            rewards[b, valid - 1] += task_reward[b]
+        valid_indices = torch.nonzero(response_mask[b]).squeeze(-1)
+        if valid_indices.numel() > 0:
+            last_idx = valid_indices[-1].item()
+            rewards[b, last_idx] += task_reward[b]
+            
     return rewards
 
 
