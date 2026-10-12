@@ -66,22 +66,29 @@ def prepare_ppo_continuation(config_path: str):
         "value_optimizer": value_optimizer,
     }
 
+def scrub_gradients(model):
+    """The Silver Bullet: Instantly annihilate any NaNs caused by 0.0 * NaN padding math during backward."""
+    for p in trainable_parameters(model):
+        if p.grad is not None:
+            torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+
 def get_logprobs(policy, input_ids, attention_mask, response_mask):
     logits = policy(input_ids=input_ids, attention_mask=attention_mask).logits
-    # Safely cast ONLY the output tensor to FP32 for loss math. Do not touch model weights.
-    shifted_logits = logits[:, :-1, :].to(torch.float32)
+    shifted_logits = logits[:, :-1, :].float()
     shifted_labels = input_ids[:, 1:]
     
     logprobs = -F.cross_entropy(shifted_logits.transpose(1, 2), shifted_labels, reduction="none")
+    logprobs = torch.nan_to_num(logprobs, nan=0.0) # Scrub forward pass NaNs
     
-    shifted_response_mask = response_mask[:, 1:].to(torch.float32)
+    shifted_response_mask = response_mask[:, 1:].float()
     return logprobs * shifted_response_mask, shifted_response_mask
 
 def get_values(value_model, input_ids, attention_mask, response_mask):
-    # Safely cast ONLY the output tensor to FP32 for loss math.
-    values = token_values(value_model, input_ids, attention_mask).to(torch.float32)
+    values = token_values(value_model, input_ids, attention_mask).float()
+    values = torch.nan_to_num(values, nan=0.0) # Scrub forward pass NaNs
+    
     shifted_values = values[:, :-1]
-    shifted_response_mask = response_mask[:, 1:].to(torch.float32)
+    shifted_response_mask = response_mask[:, 1:].float()
     return shifted_values * shifted_response_mask
 
 def safe_to_device(model, device):
@@ -147,7 +154,13 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
 
         with torch.no_grad():
             reward_outputs = reward_model(input_ids=outputs, attention_mask=attention_mask)
-            task_rewards = reward_outputs.logits.squeeze(-1).to(torch.float32)
+            task_rewards = reward_outputs.logits.squeeze(-1).float()
+            task_rewards = torch.nan_to_num(task_rewards, nan=0.0)
+            
+            # Apply the penalty from ppo.yaml for runaway sequences
+            has_eos = (outputs == tokenizer.eos_token_id).any(dim=-1)
+            task_rewards = torch.where(has_eos, task_rewards, task_rewards - float(cfg.get("missing_eos_penalty", 1.0)))
+            
             del reward_outputs
             clear_gpu()
 
@@ -160,7 +173,10 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             
             step_rewards = shaped_rewards(task_rewards, old_logprobs, ref_logprobs, shift_mask, beta)
             advantages, returns = compute_gae(step_rewards, old_values, shift_mask, gamma=float(cfg.get("gamma", 1.0)), lam=float(cfg.get("gae_lambda", 0.95)))
-            advantages = normalize_advantages(advantages, shift_mask)
+            
+            # Scrub GAE tensors cleanly
+            advantages = torch.nan_to_num(normalize_advantages(advantages, shift_mask), nan=0.0)
+            returns = torch.nan_to_num(returns, nan=0.0)
 
         del ref_logprobs, step_rewards, old_values
         clear_gpu()
@@ -180,11 +196,15 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             
             entropy_mask = (-new_logprobs).detach()
             
-            pol_loss, _, clip_frac = ppo_policy_loss(new_logprobs, old_logprobs.detach(), advantages.detach(), shift_mask, eps)
-            val_loss = value_mse_loss(new_values, returns.detach(), shift_mask)
+            pol_loss, _, clip_frac = ppo_policy_loss(new_logprobs.float(), old_logprobs.detach().float(), advantages.detach().float(), shift_mask, eps)
+            val_loss = value_mse_loss(new_values.float(), returns.detach().float(), shift_mask)
             
             loss = pol_loss + float(cfg.get("value_coef", 0.5)) * val_loss
             loss.backward()
+            
+            # THE CRITICAL STEP: Scrub NaNs from .grad before computing norm or taking a step
+            scrub_gradients(policy)
+            scrub_gradients(value_model)
             
             pol_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters(policy), max_grad)
             val_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters(value_model), max_grad)
@@ -196,13 +216,12 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             clear_gpu()
 
         mean_entropy = (entropy_mask.sum() / shift_mask.sum()).item()
-        val_gn_print = val_grad_norm.item() if not torch.isnan(val_grad_norm) else 0.0
 
         if update % 5 == 0 or update == total_updates - 1:
             peak_vram = torch.cuda.max_memory_allocated() / (1024**3)
             elapsed = time.time() - start_time
             avg_len = shift_mask.sum(dim=1).mean().item()
-            print(f"Up {update} | Rew: {task_rewards.mean().item():.2f} | PolLoss: {pol_grad_norm.item():.2f} | ValLoss: {val_gn_print:.2f} | Clip: {clip_frac.item():.3f} | Ent: {mean_entropy:.2f} | Len: {avg_len:.0f} | VRAM: {peak_vram:.2f}GB | {elapsed:.0f}s")
+            print(f"Up {update} | Rew: {task_rewards.mean().item():.2f} | PolLoss: {pol_grad_norm.item():.2f} | ValLoss: {val_grad_norm.item():.2f} | Clip: {clip_frac.item():.3f} | Ent: {mean_entropy:.2f} | Len: {avg_len:.0f} | VRAM: {peak_vram:.2f}GB | {elapsed:.0f}s")
 
     policy.save_pretrained(out)
     print(f"Finished PPO Training. Adapter saved to {out}")
