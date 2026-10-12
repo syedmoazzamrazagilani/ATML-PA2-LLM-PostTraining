@@ -74,15 +74,21 @@ def scrub_gradients(model):
 
 def get_logprobs(policy, input_ids, attention_mask, response_mask):
     logits = policy(input_ids=input_ids, attention_mask=attention_mask).logits
-    shifted_logits = logits[:, :-1, :].float()
+    shifted_logits = logits[:, :-1, :].to(torch.float32)
     shifted_labels = input_ids[:, 1:]
     
     logprobs = -F.cross_entropy(shifted_logits.transpose(1, 2), shifted_labels, reduction="none")
-    logprobs = torch.nan_to_num(logprobs, nan=0.0) # Scrub forward pass NaNs
     
-    shifted_response_mask = response_mask[:, 1:].float()
-    return logprobs * shifted_response_mask, shifted_response_mask
-
+    probs = F.softmax(shifted_logits, dim=-1)
+    logprobs_all = F.log_softmax(shifted_logits, dim=-1)
+    entropy = -torch.sum(probs * logprobs_all, dim=-1)
+    
+    shifted_response_mask = response_mask[:, 1:].to(torch.float32)
+    
+    logprobs = torch.where(shifted_response_mask.bool(), logprobs, 0.0)
+    entropy = torch.where(shifted_response_mask.bool(), entropy, 0.0)
+    
+    return logprobs, shifted_response_mask, entropy
 def get_values(value_model, input_ids, attention_mask, response_mask):
     values = token_values(value_model, input_ids, attention_mask).float()
     values = torch.nan_to_num(values, nan=0.0) # Scrub forward pass NaNs
@@ -165,16 +171,15 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             clear_gpu()
 
             with reference_mode(policy):
-                ref_logprobs, _ = get_logprobs(policy, outputs, attention_mask, response_mask)
+                ref_logprobs, _, _ = get_logprobs(policy, outputs, attention_mask, response_mask)
             clear_gpu()
             
-            old_logprobs, shift_mask = get_logprobs(policy, outputs, attention_mask, response_mask)
+            old_logprobs, shift_mask, _ = get_logprobs(policy, outputs, attention_mask, response_mask)
             old_values = get_values(value_model, outputs, attention_mask, response_mask)
             
             step_rewards = shaped_rewards(task_rewards, old_logprobs, ref_logprobs, shift_mask, beta)
             advantages, returns = compute_gae(step_rewards, old_values, shift_mask, gamma=float(cfg.get("gamma", 1.0)), lam=float(cfg.get("gae_lambda", 0.95)))
             
-            # Scrub GAE tensors cleanly
             advantages = torch.nan_to_num(normalize_advantages(advantages, shift_mask), nan=0.0)
             returns = torch.nan_to_num(returns, nan=0.0)
 
@@ -191,7 +196,7 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             pol_opt.zero_grad()
             val_opt.zero_grad()
 
-            new_logprobs, _ = get_logprobs(policy, outputs, attention_mask, response_mask)
+            new_logprobs, _, entropy_mask = get_logprobs(policy, outputs, attention_mask, response_mask)
             new_values = get_values(value_model, outputs, attention_mask, response_mask)
             
             entropy_mask = (-new_logprobs).detach()
@@ -202,7 +207,6 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             loss = pol_loss + float(cfg.get("value_coef", 0.5)) * val_loss
             loss.backward()
             
-            # THE CRITICAL STEP: Scrub NaNs from .grad before computing norm or taking a step
             scrub_gradients(policy)
             scrub_gradients(value_model)
             
@@ -221,7 +225,7 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             peak_vram = torch.cuda.max_memory_allocated() / (1024**3)
             elapsed = time.time() - start_time
             avg_len = shift_mask.sum(dim=1).mean().item()
-            print(f"Up {update} | Rew: {task_rewards.mean().item():.2f} | PolLoss: {pol_grad_norm.item():.2f} | ValLoss: {val_grad_norm.item():.2f} | Clip: {clip_frac.item():.3f} | Ent: {mean_entropy:.2f} | Len: {avg_len:.0f} | VRAM: {peak_vram:.2f}GB | {elapsed:.0f}s")
+            print(f"Up {update} | Rew: {task_rewards.mean().item():.2f} | PolLoss: {pol_loss.item():.2f} | ValLoss: {val_loss.item():.2f} | Clip: {clip_frac.item():.3f} | Ent: {mean_entropy:.2f} | Len: {avg_len:.0f} | VRAM: {peak_vram:.2f}GB | {elapsed:.0f}s")
 
     policy.save_pretrained(out)
     print(f"Finished PPO Training. Adapter saved to {out}")
