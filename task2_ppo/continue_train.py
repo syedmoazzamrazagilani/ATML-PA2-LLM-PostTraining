@@ -19,6 +19,7 @@ from common.models import (
     value_parameter_groups,
     token_values,
     clear_gpu,
+    reference_mode,
 )
 from task2_ppo.ppo import compute_gae, shaped_rewards, ppo_policy_loss, value_mse_loss, normalize_advantages
 
@@ -110,10 +111,6 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
     tokenizer = bundle["tokenizer"]
     pol_opt, val_opt = bundle["policy_optimizer"], bundle["value_optimizer"]
     
-    ref_policy = load_policy(cfg, adapter_path=cfg["paths"]["ppo_midpoint_policy"], trainable=False)
-    ref_policy = safe_to_device(ref_policy, device)
-    
-    ref_policy.eval()
     reward_model.eval()
 
     print(f"--- Starting PPO: {run_name} | Updates: {total_updates} | Eps: {eps} | Beta: {beta} ---")
@@ -131,7 +128,8 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             batch = next(loader_iter)
             
         prompts = [row["prompt"] if isinstance(row, dict) else row for row in batch]
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
+        max_prompt_len = int(cfg.get("max_prompt_length", 256))
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=max_prompt_len).to(device)
         
         policy.eval()
         with torch.no_grad():
@@ -155,8 +153,10 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             del reward_outputs
             clear_gpu()
 
-            # 2. Reference pass
-            ref_logprobs, _ = get_logprobs(ref_policy, outputs, attention_mask, response_mask)
+            # 2. Reference pass -- same weights as the policy, LoRA adapter disabled via
+            # reference_mode(), instead of a second loaded copy of the 1.5B model.
+            with reference_mode(policy):
+                ref_logprobs, _ = get_logprobs(policy, outputs, attention_mask, response_mask)
             clear_gpu()
             
             # 3. Old Policy & Value pass
@@ -185,7 +185,8 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             new_values = get_values(value_model, outputs, attention_mask, response_mask)
             
             # Unbiased Monte Carlo estimate for entropy directly from logprobs
-            entropy_mask = -new_logprobs
+            # (detached: this is a logging-only quantity, it should never carry a graph)
+            entropy_mask = (-new_logprobs).detach()
             
             pol_loss, _, clip_frac = ppo_policy_loss(new_logprobs.float(), old_logprobs.detach().float(), advantages.detach().float(), shift_mask, eps)
             val_loss = value_mse_loss(new_values.float(), returns.detach().float(), shift_mask)
