@@ -56,8 +56,8 @@ def main():
         
         with torch.no_grad():
             outputs = model.generate(
-                **inputs, 
-                max_new_tokens=int(cfg["max_sequence_length"]),
+                **inputs,
+                max_new_tokens=int(cfg.get("max_generation_tokens", 256)),
                 pad_token_id=tokenizer.eos_token_id
             )
             
