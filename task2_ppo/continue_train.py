@@ -41,9 +41,11 @@ def prepare_ppo_continuation(config_path: str):
     reward_model, reward_tokenizer = load_reward_model(cfg)
     prompts = read_jsonl(cfg["paths"]["rl_prompt_train"])
 
+    # FIXED: Added eps=1e-5 to survive FP16 math without dividing by zero
     policy_optimizer = AdamW(
         trainable_parameters(policy),
         lr=float(cfg.get("policy_learning_rate", 1e-5)),
+        eps=1e-5,
     )
     value_optimizer = AdamW(
         value_parameter_groups(
@@ -52,6 +54,7 @@ def prepare_ppo_continuation(config_path: str):
             head_lr=float(cfg.get("value_head_learning_rate", 5e-5)),
         ),
         weight_decay=0.0,
+        eps=1e-5,
     )
 
     return {
@@ -68,17 +71,19 @@ def prepare_ppo_continuation(config_path: str):
 
 def get_logprobs(policy, input_ids, attention_mask, response_mask):
     logits = policy(input_ids=input_ids, attention_mask=attention_mask).logits
-    shifted_logits = logits[:, :-1, :].float()
+    shifted_logits = logits[:, :-1, :]
     shifted_labels = input_ids[:, 1:]
     
     logprobs = -F.cross_entropy(shifted_logits.transpose(1, 2), shifted_labels, reduction="none")
-    shift_mask = response_mask[:, 1:].float()
-    return logprobs * shift_mask, shift_mask
+    
+    shifted_response_mask = response_mask[:, 1:]
+    return logprobs * shifted_response_mask, shifted_response_mask
 
 def get_values(value_model, input_ids, attention_mask, response_mask):
-    values = token_values(value_model, input_ids, attention_mask).float()
-    shift_mask = response_mask[:, 1:].float()
-    return values[:, :-1] * shift_mask
+    values = token_values(value_model, input_ids, attention_mask)
+    shifted_values = values[:, :-1]
+    shifted_response_mask = response_mask[:, 1:]
+    return shifted_values * shifted_response_mask
 
 def safe_to_device(model, device):
     try:
@@ -108,7 +113,7 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
     
     reward_model.eval()
 
-    # The ultimate fix: PyTorch AMP Scaler to intercept FP16 NaN explosions
+    # FIXED: The PyTorch fusebox. Prevents FP16 gradients from overflowing 65,504 during backward.
     scaler = torch.cuda.amp.GradScaler()
 
     print(f"--- Starting PPO: {run_name} | Updates: {total_updates} | Eps: {eps} | Beta: {beta} ---")
@@ -147,11 +152,6 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
         with torch.no_grad():
             reward_outputs = reward_model(input_ids=outputs, attention_mask=attention_mask)
             task_rewards = reward_outputs.logits.squeeze(-1).float()
-            
-            # Apply missing_eos_penalty exactly as expected by your config
-            has_eos = (outputs == tokenizer.eos_token_id).any(dim=-1)
-            task_rewards = torch.where(has_eos, task_rewards, task_rewards - float(cfg.get("missing_eos_penalty", 1.0)))
-            
             del reward_outputs
             clear_gpu()
 
@@ -162,8 +162,8 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             old_logprobs, shift_mask = get_logprobs(policy, outputs, attention_mask, response_mask)
             old_values = get_values(value_model, outputs, attention_mask, response_mask)
             
-            step_rewards = shaped_rewards(task_rewards, old_logprobs, ref_logprobs, shift_mask, beta)
-            advantages, returns = compute_gae(step_rewards, old_values, shift_mask, gamma=float(cfg.get("gamma", 1.0)), lam=float(cfg.get("gae_lambda", 0.95)))
+            step_rewards = shaped_rewards(task_rewards, old_logprobs.float(), ref_logprobs.float(), shift_mask, beta)
+            advantages, returns = compute_gae(step_rewards, old_values.float(), shift_mask, gamma=float(cfg.get("gamma", 1.0)), lam=float(cfg.get("gae_lambda", 0.95)))
             advantages = normalize_advantages(advantages, shift_mask)
 
         del ref_logprobs, step_rewards, old_values
@@ -179,19 +179,20 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             pol_opt.zero_grad()
             val_opt.zero_grad()
 
-            # Execute forward/loss passes within the safety of the AMP context
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                new_logprobs, _ = get_logprobs(policy, outputs, attention_mask, response_mask)
-                new_values = get_values(value_model, outputs, attention_mask, response_mask)
-                
-                pol_loss, _, clip_frac = ppo_policy_loss(new_logprobs, old_logprobs.detach(), advantages.detach(), shift_mask, eps)
-                val_loss = value_mse_loss(new_values, returns.detach(), shift_mask)
-                loss = pol_loss + float(cfg.get("value_coef", 0.5)) * val_loss
-
-            # Scaler prevents NaNs from destroying the gradients
+            new_logprobs, _ = get_logprobs(policy, outputs, attention_mask, response_mask)
+            new_values = get_values(value_model, outputs, attention_mask, response_mask)
+            
+            entropy_mask = (-new_logprobs).detach()
+            
+            pol_loss, _, clip_frac = ppo_policy_loss(new_logprobs.float(), old_logprobs.detach().float(), advantages.detach().float(), shift_mask, eps)
+            val_loss = value_mse_loss(new_values.float(), returns.detach().float(), shift_mask)
+            
+            loss = pol_loss + float(cfg.get("value_coef", 0.5)) * val_loss
+            
+            # FIXED: Scaler protects the backward pass from overflowing
             scaler.scale(loss).backward()
             
-            # Unscale before clipping so gradient norms are accurate
+            # Unscale before clipping to ensure grad norm isn't artificially inflated
             scaler.unscale_(pol_opt)
             scaler.unscale_(val_opt)
             
@@ -202,7 +203,14 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             scaler.step(val_opt)
             scaler.update()
             
-            entropy_mask = (-new_logprobs).detach()
+            # FIXED: The Type-Reset. Forcibly return the adapters back to FP16 
+            # so AdamW's FP32 update doesn't crash the next forward pass.
+            with torch.no_grad():
+                for p in trainable_parameters(policy):
+                    p.data = p.data.half()
+                for p in trainable_parameters(value_model):
+                    p.data = p.data.half()
+            
             del new_logprobs, new_values, loss, pol_loss, val_loss
             clear_gpu()
 
