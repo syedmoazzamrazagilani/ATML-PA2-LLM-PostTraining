@@ -79,9 +79,11 @@ def get_logprobs(policy, input_ids, attention_mask, response_mask):
     
     logprobs = -F.cross_entropy(shifted_logits.transpose(1, 2), shifted_labels, reduction="none")
     
-    probs = F.softmax(shifted_logits, dim=-1)
-    logprobs_all = F.log_softmax(shifted_logits, dim=-1)
-    entropy = -torch.sum(probs * logprobs_all, dim=-1)
+    with torch.no_grad():
+        detached_logits = shifted_logits.detach()
+        probs = F.softmax(detached_logits, dim=-1)
+        logprobs_all = F.log_softmax(detached_logits, dim=-1)
+        entropy = -torch.sum(probs * logprobs_all, dim=-1)
     
     shifted_response_mask = response_mask[:, 1:].to(torch.float32)
     
@@ -89,6 +91,7 @@ def get_logprobs(policy, input_ids, attention_mask, response_mask):
     entropy = torch.where(shifted_response_mask.bool(), entropy, 0.0)
     
     return logprobs, shifted_response_mask, entropy
+
 def get_values(value_model, input_ids, attention_mask, response_mask):
     values = token_values(value_model, input_ids, attention_mask).float()
     values = torch.nan_to_num(values, nan=0.0) # Scrub forward pass NaNs
