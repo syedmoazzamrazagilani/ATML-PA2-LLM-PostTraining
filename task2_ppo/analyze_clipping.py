@@ -88,6 +88,9 @@ def main():
                 pol_loss, _, clip_frac = ppo_policy_loss(new_logprobs.float(), old_logprobs.float(), advantages.float(), shift_mask, float(eps))
                 print(f"Epsilon: {eps} | Surrogate Loss: {pol_loss.item():.4f} | Clipped Fraction: {clip_frac.item():.4f}")
 
+    del policy, value_model, reward_model, bundle, tokenizer
+    import gc
+    gc.collect()
     clear_gpu()
 
     print("\n--- Launching Matched Short Forks ---")
