@@ -67,7 +67,6 @@ def prepare_ppo_continuation(config_path: str):
     }
 
 def scrub_gradients(model):
-    """The Silver Bullet: Instantly annihilate any NaNs caused by 0.0 * NaN padding math during backward."""
     for p in trainable_parameters(model):
         if p.grad is not None:
             torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
@@ -95,9 +94,10 @@ def get_logprobs(policy, input_ids, attention_mask, response_mask):
     entropy = torch.where(shifted_response_mask.bool(), entropy, 0.0)
     
     return logprobs, shifted_response_mask, entropy
+
 def get_values(value_model, input_ids, attention_mask, response_mask):
     values = token_values(value_model, input_ids, attention_mask).float()
-    values = torch.nan_to_num(values, nan=0.0) # Scrub forward pass NaNs
+    values = torch.nan_to_num(values, nan=0.0) 
     
     shifted_values = values[:, :-1]
     shifted_response_mask = response_mask[:, 1:].float()
@@ -169,7 +169,6 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             task_rewards = reward_outputs.logits.squeeze(-1).float()
             task_rewards = torch.nan_to_num(task_rewards, nan=0.0)
             
-            # Apply the penalty from ppo.yaml for runaway sequences
             has_eos = (outputs == tokenizer.eos_token_id).any(dim=-1)
             task_rewards = torch.where(has_eos, task_rewards, task_rewards - float(cfg.get("missing_eos_penalty", 1.0)))
             
@@ -198,14 +197,16 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
         ppo_epochs = int(cfg.get("ppo_epochs", 2))
         max_grad = float(cfg.get("max_grad_norm", 1.0))
         
+        pol_loss_val = 0.0
+        val_loss_val = 0.0
+        clip_frac_val = 0.0
+        
         for epoch_idx in range(ppo_epochs):
             pol_opt.zero_grad()
             val_opt.zero_grad()
 
             new_logprobs, _, entropy_mask = get_logprobs(policy, outputs, attention_mask, response_mask)
             new_values = get_values(value_model, outputs, attention_mask, response_mask)
-            
-            entropy_mask = (-new_logprobs).detach()
             
             pol_loss, _, clip_frac = ppo_policy_loss(new_logprobs.float(), old_logprobs.detach().float(), advantages.detach().float(), shift_mask, eps)
             val_loss = value_mse_loss(new_values.float(), returns.detach().float(), shift_mask)
@@ -216,11 +217,15 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             scrub_gradients(policy)
             scrub_gradients(value_model)
             
-            pol_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters(policy), max_grad)
-            val_grad_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters(value_model), max_grad)
+            torch.nn.utils.clip_grad_norm_(trainable_parameters(policy), max_grad)
+            torch.nn.utils.clip_grad_norm_(trainable_parameters(value_model), max_grad)
             
             pol_opt.step()
             val_opt.step()
+            
+            pol_loss_val = pol_loss.item()
+            val_loss_val = val_loss.item()
+            clip_frac_val = clip_frac.item()
             
             del new_logprobs, new_values, loss, pol_loss, val_loss
             clear_gpu()
@@ -231,7 +236,7 @@ def run_ppo(config_path: str, output: str | None = None, updates: int | None = N
             peak_vram = torch.cuda.max_memory_allocated() / (1024**3)
             elapsed = time.time() - start_time
             avg_len = shift_mask.sum(dim=1).mean().item()
-            print(f"Up {update} | Rew: {task_rewards.mean().item():.2f} | PolLoss: {pol_loss.item():.2f} | ValLoss: {val_loss.item():.2f} | Clip: {clip_frac.item():.3f} | Ent: {mean_entropy:.2f} | Len: {avg_len:.0f} | VRAM: {peak_vram:.2f}GB | {elapsed:.0f}s")
+            print(f"Up {update} | Rew: {task_rewards.mean().item():.2f} | PolLoss: {pol_loss_val:.2f} | ValLoss: {val_loss_val:.2f} | Clip: {clip_frac_val:.3f} | Ent: {mean_entropy:.2f} | Len: {avg_len:.0f} | VRAM: {peak_vram:.2f}GB | {elapsed:.0f}s")
 
     policy.save_pretrained(out)
     print(f"Finished PPO Training. Adapter saved to {out}")
