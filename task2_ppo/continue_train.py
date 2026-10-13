@@ -74,24 +74,27 @@ def scrub_gradients(model):
 
 def get_logprobs(policy, input_ids, attention_mask, response_mask):
     logits = policy(input_ids=input_ids, attention_mask=attention_mask).logits
-    shifted_logits = logits[:, :-1, :].to(torch.float32)
+    shifted_logits = logits[:, :-1, :]
     shifted_labels = input_ids[:, 1:]
     
-    logprobs = -F.cross_entropy(shifted_logits.transpose(1, 2), shifted_labels, reduction="none")
+    logprobs = -F.cross_entropy(shifted_logits.to(torch.float32).transpose(1, 2), shifted_labels, reduction="none")
+    logprobs = torch.nan_to_num(logprobs, nan=0.0)
     
     with torch.no_grad():
-        detached_logits = shifted_logits.detach()
-        probs = F.softmax(detached_logits, dim=-1)
-        logprobs_all = F.log_softmax(detached_logits, dim=-1)
-        entropy = -torch.sum(probs * logprobs_all, dim=-1)
+        entropy = torch.zeros(shifted_logits.shape[:2], device=logits.device, dtype=torch.float32)
+        for i in range(shifted_logits.shape[1]):
+            step_logits = shifted_logits[:, i, :].to(torch.float32)
+            step_probs = F.softmax(step_logits, dim=-1)
+            step_logps = F.log_softmax(step_logits, dim=-1)
+            entropy[:, i] = -torch.sum(step_probs * step_logps, dim=-1)
+        entropy = torch.nan_to_num(entropy, nan=0.0)
     
-    shifted_response_mask = response_mask[:, 1:].to(torch.float32)
+    shifted_response_mask = response_mask[:, 1:].float()
     
     logprobs = torch.where(shifted_response_mask.bool(), logprobs, 0.0)
     entropy = torch.where(shifted_response_mask.bool(), entropy, 0.0)
     
     return logprobs, shifted_response_mask, entropy
-
 def get_values(value_model, input_ids, attention_mask, response_mask):
     values = token_values(value_model, input_ids, attention_mask).float()
     values = torch.nan_to_num(values, nan=0.0) # Scrub forward pass NaNs
