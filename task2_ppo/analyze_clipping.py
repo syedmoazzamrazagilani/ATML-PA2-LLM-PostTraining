@@ -65,7 +65,7 @@ def main():
             reward_outputs = reward_model(input_ids=inputs["input_ids"], attention_mask=attention_mask)
             task_rewards = reward_outputs.logits.squeeze(-1).float()
             
-            new_logprobs, shift_mask = get_logprobs(policy, inputs["input_ids"], attention_mask, response_mask)
+            new_logprobs, shift_mask, _ = get_logprobs(policy, inputs["input_ids"], attention_mask, response_mask)
             old_values = get_values(value_model, inputs["input_ids"], attention_mask, response_mask)
             
             old_logprobs = torch.tensor(row["old_logprobs"]).unsqueeze(0).to(device).float()
