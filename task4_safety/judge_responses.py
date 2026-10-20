@@ -145,6 +145,7 @@ def main():
     ap.add_argument("--input", help="Optional generated JSONL file to inspect")
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--policies", nargs="*", default=["sft", "dpo", "ppo", "grpo"])
+    ap.add_argument("--overwrite", action="store_true")
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
@@ -163,7 +164,8 @@ def main():
         for start in tqdm(range(0, len(rows), args.batch_size), desc="Judging input"):
             judged.extend(judge_batch(tok, model, rows[start : start + args.batch_size], max_new_tokens))
         write_jsonl(outdir / "judged_custom.jsonl", judged)
-        clear_gpu(model, tok)
+        del model, tok
+        clear_gpu()
         return
 
     all_judged = []
@@ -173,13 +175,26 @@ def main():
         if not in_path.exists():
             raise FileNotFoundError(f"Missing generated file {in_path}. Run task4_safety.generate_responses first.")
         rows = read_jsonl(in_path)
+        out_path = outdir / f"judged_{policy_name}.jsonl"
+
+        if not args.overwrite and out_path.exists():
+            existing_judged = read_jsonl(out_path)
+            if len(existing_judged) == len(rows):
+                counts = {}
+                for r in existing_judged:
+                    lbl = r["judge_label"]
+                    counts[lbl] = counts.get(lbl, 0) + 1
+                quick_counts[policy_name] = counts
+                all_judged.extend(existing_judged)
+                print(f"[Task 4] Reusing existing {out_path} | Label counts: {counts}")
+                continue
+
         print(f"\n--- Judging {len(rows)} responses for policy: {policy_name} ---")
         judged_rows = []
         for start in tqdm(range(0, len(rows), args.batch_size), desc=f"Judge ({policy_name})"):
             chunk = rows[start : start + args.batch_size]
             judged_rows.extend(judge_batch(tok, model, chunk, max_new_tokens=max_new_tokens))
 
-        out_path = outdir / f"judged_{policy_name}.jsonl"
         write_jsonl(out_path, judged_rows)
         all_judged.extend(judged_rows)
 
@@ -192,7 +207,8 @@ def main():
 
     write_jsonl(outdir / "judged_all.jsonl", all_judged)
     save_json(outdir / "judge_label_counts.json", quick_counts)
-    clear_gpu(model, tok)
+    del model, tok
+    clear_gpu()
     print("Completed Task 4 AI safety judging.")
 
 
